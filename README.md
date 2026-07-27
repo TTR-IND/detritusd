@@ -59,7 +59,7 @@ contributions documenting or automating that are welcome.
   once `MemAvailable` recovers or PSI drops back below threshold.
 - Publishes live status (`/run/detritus/status.json`) for anything
   that wants to display it — see
-  [Gonzo System Monitor](https://github.com/YOUR_GITHUB/gonzo-system-monitor)
+  [Gonzo System Monitor](https://github.com/TTR-IND/gonzo-system-monitor)
   for a GUI that consumes this.
 
 ## Requirements
