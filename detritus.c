@@ -187,6 +187,56 @@ static void write_proc_sys(const char *path, const char *value)
     close(fd);
 }
 
+/* ── ZSWAP override ─────────────────────────────────────────────────────
+ *
+ * zswap sits in front of zram in the kernel's reclaim path: if zswap is
+ * enabled, it intercepts and compresses evicted pages before they ever
+ * reach a zram device, meaning most of a zram device's own compression
+ * work goes unused even though it appears "active" via
+ * zramctl/swapon -s. This isn't a hypothetical -- it's the documented
+ * interaction between the two subsystems.
+ *
+ * This daemon's existing design already takes the same stance toward
+ * partition swap (tune_vm_for_zram() disables it once zram is active,
+ * rather than trying to coexist with it): own the memory-compression
+ * layer outright rather than share it with something else that could
+ * be silently absorbing most of the traffic. zswap gets the same
+ * treatment -- disabled here, unconditionally, before zram
+ * provisioning runs, so the zram device this daemon creates is
+ * actually the thing doing the work.
+ *
+ * Whether zswap was pre-enabled by the distro, a previous session, or
+ * a systemd/dracut default is irrelevant -- the point of this
+ * function is that after it runs, the answer is always "no", so
+ * provision_zram() below can assume it's configuring the real
+ * compression layer, not a second one shadowed by a first.
+ */
+static void disable_zswap(void)
+{
+    const char *zswap_enabled = "/sys/module/zswap/parameters/enabled";
+    if (access(zswap_enabled, F_OK) != 0) {
+        /* zswap not compiled into this kernel at all -- nothing to
+         * override, and this is not a warning-worthy condition. */
+        return;
+    }
+
+    FILE *f = fopen(zswap_enabled, "r");
+    if (f) {
+        char cur[8] = {0};
+        if (fgets(cur, sizeof(cur), f)) {
+            if (cur[0] == 'N') {
+                fclose(f);
+                rp_log(LOG_INFO, "zswap already disabled");
+                return;
+            }
+        }
+        fclose(f);
+    }
+
+    write_proc_sys(zswap_enabled, "N");
+    rp_log(LOG_INFO, "disabled zswap -- zram is the sole compression layer");
+}
+
 /* ── ZRAM provisioning ─────────────────────────────────────────────────── */
 static void provision_zram(int slow)
 {
@@ -1168,8 +1218,8 @@ done:
  * replace -- the PSI-reactive freeze/pageout path in handle_pressure(),
  * which remains the last-resort fallback for genuine emergencies.
  *
- * Design constraints, each chosen specifically to make thrashing
- * structurally impossible rather than merely unlikely:
+ * Design constraints, each chosen specifically to keep the daemon
+ * itself from ever being the source of a new problem:
  *
  *   - Fixed 400ms cadence, comfortably under the 500ms ceiling. No
  *     variable backoff, no burst catch-up -- exactly one cycle's worth
@@ -1650,6 +1700,7 @@ int main(int argc, char *argv[])
 
     /* Phase 1 */
     g_storage_type = detect_storage();
+    disable_zswap();
     provision_zram(storage_is_slow(g_storage_type));
     tune_vm_for_zram();
 
