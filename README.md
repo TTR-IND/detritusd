@@ -1,11 +1,11 @@
 # detritusd
 
 A PSI-driven memory pressure daemon for Linux, inspired by the design
-goals of Apple's Jetsam: relieve memory pressure before it becomes a
-user-visible stall, without ever needing a fixed threshold that
-"suddenly" kicks in and thrashes the system.
+goals of Apple's Jetsam: keep applications responsive under heavy
+multitasking, and prevent processes from freezing under memory
+pressure, without a fixed threshold that "suddenly" kicks in.
 
-detritus does two independent things:
+detritusd does two independent things:
 
 1. **Proactive idle trickle.** A continuous, low-priority background
    thread marks memory from genuinely idle processes as reclaimable
@@ -19,14 +19,19 @@ detritus does two independent things:
    Stall Information)](https://docs.kernel.org/accounting/psi.html)
    signal crosses a real stall threshold — meaning a process is
    *actually* waiting on memory, not just "memory usage is high" —
-   detritus freezes (`SIGSTOP`) the least-recently-useful large
+   detritusd freezes (`SIGSTOP`) the least-recently-useful large
    process and trickles its memory into ZRAM, then resumes it the
    moment pressure clears. This is the emergency fallback, not the
    normal mode of operation.
 
-Both mechanisms are designed so that "the daemon itself causing
-thrashing" is structurally impossible, not just unlikely — see the
-comments in `detritus.c` for the reasoning behind each design choice.
+Both mechanisms are designed to make the daemon itself an unlikely
+source of any new problem: `MADV_COLD` is a soft hint the kernel
+schedules on its own timeline, so it cannot force the kind of repeated
+eviction-and-refault cycle that would actually be called "thrashing" —
+what it targets instead is preventing the freeze a process experiences
+when it's the one caught waiting on memory under real pressure. See
+the comments in `detritus.c` for the reasoning behind each design
+choice.
 
 ## Status
 
