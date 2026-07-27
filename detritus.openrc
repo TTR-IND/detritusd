@@ -1,0 +1,59 @@
+#!/sbin/openrc-run
+# detritus -- memory pressure manager (OpenRC service)
+#
+# detritus.c is a long-running foreground process: main() blocks in an
+# epoll_wait loop and never forks/setsid's itself into the background
+# (confirmed by reading detritus.c's main() -- there is no fork() call
+# anywhere in the file). This matches the systemd unit's Type=simple
+# (systemd's convention for "does not self-daemonize"), so under OpenRC
+# the equivalent is start-stop-daemon --background, which forks the
+# process into the background on the supervisor's behalf rather than
+# expecting the binary to do it itself.
+
+name="detritusd"
+description="Memory pressure manager (Jetsam-style freeze+compress for Linux)"
+command="/usr/local/sbin/detritusd"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+# DETRITUS_NOTIFY_USER is read by detritus.c in two places: notify_user()
+# (who gets the desktop notification when a process is frozen) and
+# scanner_thread() (restricts victim scanning to one user's processes if
+# set). Without this set, both behaviors silently never activate -- not
+# a crash, just quietly absent functionality. Set it in
+# /etc/conf.d/detritus, which OpenRC sources automatically before
+# start() runs (standard OpenRC convention, not detritusd-specific).
+export DETRITUS_NOTIFY_USER
+
+output_log="/var/log/detritusd.log"
+error_log="/var/log/detritusd.log"
+
+depend() {
+	# Depend on the boot RUNLEVEL, not a specific service name inside
+	# it. 'need localmount' failed on the real target system with
+	# "Service 'detritus' needs non existent service 'localmount'" --
+	# that service name is not universal across every Devuan/OpenRC
+	# install (naming can differ depending on fstab setup and which
+	# mount-related services actually get registered), and this file
+	# was written from OpenRC's general documented conventions without
+	# a real OpenRC system available to verify the exact service name
+	# against. 'boot' is one of OpenRC's three internal runlevels and
+	# is guaranteed to exist by definition on every OpenRC system,
+	# unlike any specific service that runs inside it -- depending on
+	# the runlevel rather than guessing at a service name inside it is
+	# the more conservative, verifiably-correct claim.
+	after boot
+	# detritus provisions zram and needs /proc/pressure/memory (PSI),
+	# both of which require the kernel to be fully up; "after sysfs"
+	# ensures /sys/block is populated before detritus's own storage
+	# detection (detect_storage() in detritus.c) runs. sysfs is part
+	# of the sysinit runlevel, which the boot runlevel already
+	# depends on, so this is likely redundant with "after boot" above
+	# -- kept anyway since it costs nothing and documents the actual
+	# reason (PSI/sysfs availability), not just "boot happened".
+	after sysfs
+}
+
+start_pre() {
+	checkpath --file --mode 0644 "$output_log"
+}
