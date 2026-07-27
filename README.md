@@ -31,7 +31,9 @@ choice.
 desktop, on real hardware.** It should work on any Devuan-based or
 similar OpenRC-based Linux system with a reasonably recent kernel
 (5.10+ for `process_madvise`; PSI support compiled in, which is
-standard on most modern kernels).
+standard on most modern kernels). Testing on a 16 year old Intel Atom
+laptopyelided impressive results with Chrome staying completely stable
+and very responsive during heavy video playback and benchmark tests.
 
 It has **not** been tested on other distributions or init systems
 (systemd, runit, s6, etc.). The core daemon (`detritus.c`) has no
