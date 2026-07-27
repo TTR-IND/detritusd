@@ -9,11 +9,9 @@ detritusd does two independent things:
 
 1. **Proactive idle trickle.** A continuous, low-priority background
    thread marks memory from genuinely idle processes as reclaimable
-   (`MADV_COLD`), at a fixed, gentle cadence that scales up smoothly
-   with how fast memory is actually being consumed — never a fixed
-   burst, never something that can itself cause the system to feel
-   sluggish, because `MADV_COLD` is a soft hint the kernel schedules
-   on its own terms, not a forced synchronous reclaim.
+   (`MADV_COLD`), at a gentle cadence that scales up smoothly with how
+   fast memory is actually being consumed. `MADV_COLD` is a hint the
+   kernel schedules on its own terms rather than a forced reclaim.
 
 2. **Reactive last-resort relief.** If the kernel's own [PSI (Pressure
    Stall Information)](https://docs.kernel.org/accounting/psi.html)
@@ -24,13 +22,7 @@ detritusd does two independent things:
    moment pressure clears. This is the emergency fallback, not the
    normal mode of operation.
 
-Both mechanisms are designed to make the daemon itself an unlikely
-source of any new problem: `MADV_COLD` is a soft hint the kernel
-schedules on its own timeline, so it cannot force the kind of repeated
-eviction-and-refault cycle that would actually be called "thrashing" —
-what it targets instead is preventing the freeze a process experiences
-when it's the one caught waiting on memory under real pressure. See
-the comments in `detritus.c` for the reasoning behind each design
+See the comments in `detritus.c` for the reasoning behind each design
 choice.
 
 ## Status
