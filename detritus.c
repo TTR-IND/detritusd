@@ -55,7 +55,9 @@
 #define PSI_THRESHOLD_US    5000   /* 5ms stall within window              */
 #define PSI_WINDOW_US     200000   /* 200ms measurement window              */
 
-#define SCAN_INTERVAL_MS   2000    /* victim scanner period (ms)            */
+/* Scanner removed -- victim selection is now on-demand via
+ * select_cold_victims(), called only when needed (trickle cycle or an
+ * actual PSI trigger), not on a background timer. */
 #define RSS_GROWTH_KB      (5*1024)/* exclude processes growing > 5MB/150ms */
 #define MIN_VICTIM_RSS_KB (50*1024)/* ignore processes under 50MB RSS       */
 
@@ -319,88 +321,42 @@ static void tune_vm_for_zram(void)
     fclose(sw);
 }
 
-/* ── Pre-computed victim list (updated by scanner thread) ──────────────── */
+/* ── On-demand cold-victim selection ─────────────────────────────────────
+ *
+ * No background scanner, no persistent tracking table, no continuously
+ * maintained ranking. select_cold_victims() (defined below, after
+ * is_skip(), which it depends on) does one real /proc walk and
+ * returns immediately -- it is only ever called at the moment a
+ * caller actually needs a victim (the trickle thread's own 400ms
+ * action cycle, or handle_pressure() at the exact instant PSI fires),
+ * never on its own timer.
+ *
+ * "Coldness" is read directly from the kernel's own per-process page
+ * table accessed-bit accounting, via /proc/pid/smaps_rollup's
+ * Referenced field relative to Rss -- Referenced is the kernel's
+ * live answer to "how much of this process's memory has actually
+ * been touched recently", the same underlying signal the kernel's
+ * own LRU/reclaim machinery already uses. This replaces a prior
+ * design that re-derived a similar fact in userspace by sampling CPU
+ * ticks across repeated /proc scans and accumulating a streak counter
+ * over time -- duplicating, less accurately and on a slower cadence,
+ * something the kernel already tracks continuously for free.
+ *
+ * coldness_pct = 100 - (Referenced * 100 / Rss): 0% means everything
+ * was recently touched (hot, not a good victim); 100% means nothing
+ * in this process's memory has been referenced recently by the
+ * kernel's own accounting (cold, a good victim). Processes below
+ * MIN_VICTIM_RSS_KB or on SKIP_NAMES are never candidates, matching
+ * the previous design's floors.
+ */
 #define MAX_CANDIDATES 8
 
 typedef struct {
     pid_t pid;
     long  rss_kb;
     char  name[64];
-    int   idle_streak;   /* consecutive scans with cpu delta == 0, from g_track */
+    int   coldness_pct;   /* 0-100, from kernel Referenced/Rss, not tracked over time */
 } candidate_t;
-
-static candidate_t  g_candidates[MAX_CANDIDATES];
-static int          g_n_candidates = 0;
-static pthread_mutex_t g_cand_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/*
- * ── Persistent idle-streak tracking ─────────────────────────────────────
- *
- * State-driven backgrounded-duration tracking, without a window server.
- *
- * Jetsam ranks kill candidates primarily by how long an app has been
- * backgrounded, size second. detritus has no window-focus concept and
- * deliberately does not acquire one (no X11/Wayland dependency in a
- * daemon that otherwise runs headless) -- instead, "backgrounded a
- * while" is reconstructed from state already available in /proc:
- * a process is treated as backgrounded-and-idle if it has gone
- * multiple consecutive scan cycles with zero scheduler activity.
- * A single idle sample is noisy (a background process can tick
- * briefly for an unrelated timer); a sustained streak is not.
- *
- * Ownership: owned by the scanner thread, same lifetime as g_candidates,
- * protected by the same g_cand_lock since both are written in the same
- * scan-cycle critical section.
- *
- * PID reuse: a slot is keyed on (pid, starttime_ticks). starttime_ticks
- * (field 22 of /proc/pid/stat) is immutable for the life of a specific
- * process, so if a slot's stored starttime no longer matches the live
- * process at that pid, the slot belonged to a since-exited process and
- * must not be reused for the new one -- otherwise the new process
- * silently inherits a streak count it never earned.
- *
- * Bounded and evicted: capped at MAX_TRACKED, LRU-evicted by last-seen
- * scan sequence number, so a system cycling through many short-lived
- * processes cannot grow this table without bound.
- */
-#define MAX_TRACKED 256
-
-typedef struct {
-    pid_t pid;
-    unsigned long long starttime_ticks;
-    unsigned long long last_cpu_ticks;
-    int   idle_streak;
-    int   in_use;
-    unsigned long last_seen_seq;
-} track_slot_t;
-
-static track_slot_t g_track[MAX_TRACKED];
-static unsigned long g_scan_seq = 0;  /* protected by g_cand_lock */
-
-/* Find or create the tracking slot for (pid, starttime). Must be called
- * with g_cand_lock held. Returns NULL only if the table is full and no
- * slot could be evicted, which cannot happen in practice since eviction
- * always succeeds against the oldest last_seen_seq. */
-static track_slot_t *track_lookup_or_create(pid_t pid, unsigned long long starttime)
-{
-    int free_idx = -1;
-    int lru_idx  = 0;
-    for (int i = 0; i < MAX_TRACKED; i++) {
-        if (g_track[i].in_use && g_track[i].pid == pid &&
-            g_track[i].starttime_ticks == starttime) {
-            return &g_track[i];
-        }
-        if (!g_track[i].in_use && free_idx < 0) free_idx = i;
-        if (g_track[i].last_seen_seq < g_track[lru_idx].last_seen_seq) lru_idx = i;
-    }
-    int idx = (free_idx >= 0) ? free_idx : lru_idx;
-    g_track[idx].pid             = pid;
-    g_track[idx].starttime_ticks = starttime;
-    g_track[idx].last_cpu_ticks  = 0;
-    g_track[idx].idle_streak     = 0;
-    g_track[idx].in_use          = 1;
-    return &g_track[idx];
-}
 
 /* Processes to never freeze -- kernel truncates comm to 15 chars in
  * /proc/pid/status so all entries here must be <= 15 characters. */
@@ -428,6 +384,85 @@ static int is_skip(const char *name)
     for (int i = 0; SKIP_NAMES[i]; i++)
         if (strcmp(name, SKIP_NAMES[i]) == 0) return 1;
     return 0;
+}
+
+/* Read Rss and Referenced (both in KB) from a process's smaps_rollup.
+ * Returns 0 on success, -1 if unreadable (process gone, permission,
+ * or no smaps_rollup support -- all expected, not exceptional, given
+ * this walks a live, changing /proc). */
+static int read_coldness(pid_t pid, long *rss_kb, long *referenced_kb)
+{
+    char path[32];
+    snprintf(path, sizeof(path), "/proc/%d/smaps_rollup", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    *rss_kb = -1;
+    *referenced_kb = -1;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "Rss:", 4) == 0) sscanf(line + 4, "%ld", rss_kb);
+        else if (strncmp(line, "Referenced:", 11) == 0) sscanf(line + 11, "%ld", referenced_kb);
+    }
+    fclose(f);
+    return (*rss_kb >= 0 && *referenced_kb >= 0) ? 0 : -1;
+}
+
+/* Walk /proc once, rank by coldness (kernel Referenced/Rss), return
+ * the results sorted coldest-first into out[], capped at max_out.
+ * Returns the number of candidates found. Pure, on-demand, no shared
+ * state -- every call is a fresh, independent snapshot. */
+static int select_cold_victims(candidate_t *out, int max_out)
+{
+    int n_found = 0;
+    DIR *pd = opendir("/proc");
+    if (!pd) return 0;
+
+    struct dirent *ent;
+    while ((ent = readdir(pd)) != NULL) {
+        if (ent->d_name[0] < '1' || ent->d_name[0] > '9') continue;
+        pid_t pid = (pid_t)atoi(ent->d_name);
+        if (pid <= 0) continue;
+
+        char statusp[32];
+        snprintf(statusp, sizeof(statusp), "/proc/%d/status", pid);
+        FILE *sf = fopen(statusp, "r");
+        if (!sf) continue;
+        char name[64] = {0};
+        char line[256];
+        while (fgets(line, sizeof(line), sf))
+            if (strncmp(line, "Name:", 5) == 0) { sscanf(line + 5, "%63s", name); break; }
+        fclose(sf);
+
+        if (is_skip(name)) continue;
+
+        long rss_kb, referenced_kb;
+        if (read_coldness(pid, &rss_kb, &referenced_kb) != 0) continue;
+        if (rss_kb < MIN_VICTIM_RSS_KB) continue;
+
+        int coldness = (rss_kb > 0)
+            ? (int)(100 - (referenced_kb * 100 / rss_kb))
+            : 0;
+        if (coldness < 0) coldness = 0;
+        if (coldness > 100) coldness = 100;
+
+        /* Insertion-sort into out[], coldest first. */
+        int j = n_found < max_out ? n_found : max_out - 1;
+        if (n_found < max_out) n_found++;
+        while (j > 0 && out[j-1].coldness_pct < coldness) {
+            if (j < max_out) out[j] = out[j-1];
+            j--;
+        }
+        if (j < max_out) {
+            out[j].pid = pid;
+            out[j].rss_kb = rss_kb;
+            out[j].coldness_pct = coldness;
+            memcpy(out[j].name, name, sizeof(out[j].name) - 1);
+            out[j].name[sizeof(out[j].name) - 1] = '\0';
+        }
+    }
+    closedir(pd);
+    return n_found;
 }
 
 /* Forward declarations: write_status_file needs these, but their canonical
@@ -477,11 +512,12 @@ static pthread_mutex_t g_trickle_lock = PTHREAD_MUTEX_INITIALIZER;
  *   Refuses   -- never requires root to read (0644); never blocks a
  *     reader; never partially updates the file in place.
  *
- * Called from the scanner thread while g_cand_lock is already held with
- * fresh data -- no additional locking needed for g_candidates. Reads
- * g_frozen_pid/g_frozen_name under the same lock, which tightens their
- * previous informal single-thread-touches-them invariant into an
- * explicit one now that a second reader (this function) exists.
+ * Called from the idle-trickle thread's own cycle (the only
+ * continuously-running loop left in this daemon) -- publishes
+ * whatever select_cold_victims() finds on that same pass, so the
+ * status file's candidate list reflects the trickle thread's own
+ * current view, not a separately-maintained table. g_frozen_pid/
+ * g_frozen_name are read under g_frozen_lock, unchanged from before.
  */
 #define DETRITUS_STATUS_DIR  "/run/detritus"
 #define DETRITUS_STATUS_PATH DETRITUS_STATUS_DIR "/status.json"
@@ -551,8 +587,7 @@ static long read_gonzocache_resident_kb(void)
     return total_resident_kb;
 }
 
-/* Must be called with g_cand_lock held (for g_candidates/g_n_candidates). */
-static void write_status_file(void)
+static void write_status_file(const candidate_t *candidates, int n_candidates)
 {
     static int dir_ready = 0;
     if (!dir_ready) {
@@ -672,13 +707,13 @@ static void write_status_file(void)
     }
 
     fprintf(f, "  \"candidates\": [\n");
-    for (int i = 0; i < g_n_candidates; i++) {
+    for (int i = 0; i < n_candidates; i++) {
         fprintf(f,
             "    { \"pid\": %d, \"name\": \"%s\", \"rss_kb\": %ld, "
-            "\"idle_streak\": %d }%s\n",
-            (int)g_candidates[i].pid, g_candidates[i].name,
-            g_candidates[i].rss_kb, g_candidates[i].idle_streak,
-            (i == g_n_candidates - 1) ? "" : ",");
+            "\"coldness_pct\": %d }%s\n",
+            (int)candidates[i].pid, candidates[i].name,
+            candidates[i].rss_kb, candidates[i].coldness_pct,
+            (i == n_candidates - 1) ? "" : ",");
     }
     fprintf(f, "  ]\n}\n");
 
@@ -692,222 +727,6 @@ static void write_status_file(void)
     }
 }
 
-/* ── Scanner thread -- runs every SCAN_INTERVAL_MS ────────────────────── */
-/*
- * Two-pass RSS snapshot with 150ms gap to detect actively-growing processes.
- * Growing processes are excluded as the pressure source.
- * Results are sorted by RSS descending and stored in g_candidates.
- */
-static void *scanner_thread(void *arg)
-{
-    (void)arg;
-
-    const char *notify_user = getenv("DETRITUS_NOTIFY_USER");
-    long target_uid = -1;
-    if (notify_user && notify_user[0]) {
-        char cmd[128];
-        snprintf(cmd, sizeof(cmd), "id -u %s 2>/dev/null", notify_user);
-        FILE *p = popen(cmd, "r");
-        if (p) { if (fscanf(p, "%ld", &target_uid) != 1) target_uid=-1; pclose(p); }
-    }
-
-#define MAX_SCAN 512
-    typedef struct {
-        pid_t pid; long rss1; long rss2; char name[64];
-        unsigned long long cpu_ticks1, cpu_ticks2;
-        unsigned long long starttime_ticks;
-    } scan_t;
-    scan_t *buf = calloc(MAX_SCAN, sizeof(scan_t));
-    if (!buf) return NULL;
-
-    while (1) {
-        int n = 0;
-
-        /* Pass 1: snapshot RSS */
-        DIR *pd = opendir("/proc");
-        if (pd) {
-            struct dirent *ent;
-            while ((ent = readdir(pd)) != NULL && n < MAX_SCAN) {
-                if (ent->d_name[0] < '1' || ent->d_name[0] > '9') continue;
-                if (strlen(ent->d_name) > 7) continue;
-                char sp[32];
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-truncation"
-                snprintf(sp, sizeof(sp), "/proc/%s/status", ent->d_name);
-#pragma GCC diagnostic pop
-                FILE *sf = fopen(sp, "r"); if (!sf) continue;
-                pid_t pid = 0; long uid = -1, rss = 0; char name[64]={0};
-                char line[256];
-                while (fgets(line, sizeof(line), sf)) {
-                    if      (strncmp(line,"Pid:", 4)==0)  sscanf(line+4, "%d",  &pid);
-                    else if (strncmp(line,"Uid:", 4)==0)  sscanf(line+4, "%ld", &uid);
-                    else if (strncmp(line,"Name:",5)==0)  sscanf(line+5, "%63s", name);
-                    else if (strncmp(line,"VmRSS:",6)==0) sscanf(line+6, "%ld", &rss);
-                }
-                fclose(sf);
-                if (target_uid >= 0 && uid != target_uid) continue;
-                if (rss < MIN_VICTIM_RSS_KB) continue;
-                if (is_skip(name)) continue;
-
-                /* CPU-recency: read utime+stime (fields 14,15 of stat) now;
-                 * pass 2 re-reads after the 150ms gap. A delta > 0 means
-                 * the scheduler actually ran this process in that window --
-                 * i.e. it is in active use, not merely resident. This is
-                 * the always-available floor for "don't disturb what the
-                 * user is doing" -- independent of and more reliable than
-                 * the X11 focus signal, which requires a display server
-                 * and fails closed to nothing if unavailable. */
-                unsigned long long cpu_ticks = 0;
-                unsigned long long starttime = 0;
-                char statp[32];
-                snprintf(statp, sizeof(statp), "/proc/%d/stat", pid);
-                FILE *stf = fopen(statp, "r");
-                if (stf) {
-                    char sbuf[512];
-                    if (fgets(sbuf, sizeof(sbuf), stf)) {
-                        char *rp = strrchr(sbuf, ')');
-                        if (rp) {
-                            unsigned long long ut = 0, st = 0, stt = 0;
-                            /* fields after ") " are: state ppid pgrp session
-                             * tty_nr tpgid flags minflt cminflt majflt
-                             * cmajflt utime stime cutime cstime priority
-                             * nice num_threads itrealvalue starttime --
-                             * utime/stime are tokens 13/14, starttime is
-                             * token 20 after the comm field. */
-                            sscanf(rp + 2,
-                                "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u "
-                                "%llu %llu %*d %*d %*d %*d %*d %*d %llu",
-                                &ut, &st, &stt);
-                            cpu_ticks = ut + st;
-                            starttime = stt;
-                        }
-                    }
-                    fclose(stf);
-                }
-
-                buf[n].pid  = pid;
-                buf[n].rss1 = rss;
-                buf[n].rss2 = 0;
-                buf[n].cpu_ticks1 = cpu_ticks;
-                buf[n].cpu_ticks2 = 0;
-                buf[n].starttime_ticks = starttime;
-                memcpy(buf[n].name, name, 63); buf[n].name[63]=0;
-                n++;
-            }
-            closedir(pd);
-        }
-
-        /* 150ms gap */
-        struct timespec gap = { .tv_sec=0, .tv_nsec=150000000L };
-        nanosleep(&gap, NULL);
-
-        /* Pass 2: re-read RSS, exclude growers; re-read CPU ticks for the
-         * idle-streak signal (same 150ms gap already paid for above). */
-        for (int i = 0; i < n; i++) {
-            char sp[32];
-            snprintf(sp, sizeof(sp), "/proc/%d/status", buf[i].pid);
-            FILE *sf = fopen(sp, "r"); if (!sf) { buf[i].rss2=-1; continue; }
-            char line[256];
-            while (fgets(line, sizeof(line), sf))
-                if (strncmp(line,"VmRSS:",6)==0) { sscanf(line+6,"%ld",&buf[i].rss2); break; }
-            fclose(sf);
-
-            char statp[32];
-            snprintf(statp, sizeof(statp), "/proc/%d/stat", buf[i].pid);
-            FILE *stf = fopen(statp, "r");
-            if (stf) {
-                char sbuf[512];
-                if (fgets(sbuf, sizeof(sbuf), stf)) {
-                    char *rp = strrchr(sbuf, ')');
-                    if (rp) {
-                        unsigned long long ut = 0, st = 0;
-                        sscanf(rp + 2,
-                            "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u "
-                            "%llu %llu", &ut, &st);
-                        buf[i].cpu_ticks2 = ut + st;
-                    }
-                }
-                fclose(stf);
-            }
-        }
-
-        /* Update persistent idle-streak history for every scanned process,
-         * before filtering. This runs regardless of RSS-growth exclusion
-         * below, so a process temporarily filtered out this cycle (e.g.
-         * caught mid-allocation-burst) doesn't lose accumulated history it
-         * may need next cycle when it reappears as an eligible candidate. */
-        pthread_mutex_lock(&g_cand_lock);
-        g_scan_seq++;
-        for (int i = 0; i < n; i++) {
-            if (buf[i].rss2 <= 0) continue;  /* process exited between passes */
-            track_slot_t *ts = track_lookup_or_create(buf[i].pid, buf[i].starttime_ticks);
-            unsigned long long delta = buf[i].cpu_ticks2 - buf[i].cpu_ticks1;
-            ts->idle_streak = (delta == 0) ? (ts->idle_streak + 1) : 0;
-            ts->last_cpu_ticks = buf[i].cpu_ticks2;
-            ts->last_seen_seq  = g_scan_seq;
-        }
-
-        /* Build ranked candidate list.
-         *
-         * Primary key: idle_streak descending (Jetsam-parity -- prefer the
-         *   process that has been out of active use longest; a process
-         *   with idle_streak == 0 was scheduled during the last 150ms gap
-         *   and is hard-excluded below, not merely deprioritized, since
-         *   freezing something the user is actively driving is a
-         *   correctness violation, not a tuning choice).
-         * Secondary key: rss_kb descending (unchanged from before --
-         *   maximizes relief per freeze+compress action among candidates
-         *   that are equally "not in active use").
-         */
-        g_n_candidates = 0;
-        for (int i = 0; i < n && g_n_candidates < MAX_CANDIDATES; i++) {
-            if (buf[i].rss2 <= 0) continue;
-            long growth = buf[i].rss2 - buf[i].rss1;
-            if (growth > RSS_GROWTH_KB) {
-                rp_log(LOG_INFO, "scanner: excluding '%s' (growing %ld MB/150ms)",
-                       buf[i].name, growth/1024);
-                continue;
-            }
-
-            track_slot_t *ts = track_lookup_or_create(buf[i].pid, buf[i].starttime_ticks);
-            if (ts->idle_streak == 0) continue;  /* actively scheduled -- do not touch */
-
-            int streak = ts->idle_streak;
-
-            /* Insert sorted: idle_streak descending, rss_kb descending tiebreak */
-            int j = g_n_candidates;
-            while (j > 0 &&
-                   (g_candidates[j-1].idle_streak < streak ||
-                    (g_candidates[j-1].idle_streak == streak &&
-                     g_candidates[j-1].rss_kb < buf[i].rss2))) {
-                if (j < MAX_CANDIDATES) g_candidates[j] = g_candidates[j-1];
-                j--;
-            }
-            if (j < MAX_CANDIDATES) {
-                g_candidates[j].pid         = buf[i].pid;
-                g_candidates[j].rss_kb      = buf[i].rss2;
-                g_candidates[j].idle_streak = streak;
-                strncpy(g_candidates[j].name, buf[i].name, 63);
-                g_n_candidates++;
-            }
-        }
-        if (g_n_candidates > 0)
-            rp_log(LOG_INFO, "scanner: top victim candidate: '%s' (%ld MB RSS, idle %d scans)",
-                   g_candidates[0].name, g_candidates[0].rss_kb / 1024,
-                   g_candidates[0].idle_streak);
-        write_status_file();
-        pthread_mutex_unlock(&g_cand_lock);
-
-        /* Sleep until next scan (minus the 150ms we already spent) */
-        struct timespec sleep_ts = {
-            .tv_sec  = (SCAN_INTERVAL_MS - 150) / 1000,
-            .tv_nsec = ((SCAN_INTERVAL_MS - 150) % 1000) * 1000000L,
-        };
-        nanosleep(&sleep_ts, NULL);
-    }
-    free(buf);
-    return NULL;
-}
 
 /* ── Process helpers ───────────────────────────────────────────────────── */
 static void signal_process_tree(pid_t root, int sig)
@@ -1236,24 +1055,24 @@ done:
  *     cycle. Never sweeps a whole process, never touches more than one
  *     candidate per cycle -- matching the reactive path's existing
  *     one-victim-at-a-time discipline.
- *   - Only processes with idle_streak >= TRICKLE_IDLE_FLOOR (30 scans,
- *     roughly 60s of zero scheduler activity at the scanner's 2s
- *     cadence) are eligible. Being at the top of g_candidates isn't
- *     sufficient on its own -- on a system with few background
- *     processes, the top candidate could be only lightly idle, and
- *     lightly-idle memory is exactly what shouldn't be pre-emptively
- *     touched.
+ *   - Only processes with coldness_pct >= TRICKLE_COLDNESS_FLOOR (70%,
+ *     meaning at least 70% of the process's resident memory has not
+ *     been referenced recently per the kernel's own page-table
+ *     accounting) are eligible. Being the single coldest candidate
+ *     isn't sufficient on its own -- on a system with few background
+ *     processes, the coldest available candidate could still be only
+ *     lightly cold, and lightly-cold memory is exactly what shouldn't
+ *     be pre-emptively touched.
  *
- * Selection reuses g_candidates (already ranked by idle_streak
- * descending, maintained by the scanner thread) rather than performing
- * its own scan -- this is the same tracking table the reactive path's
- * ranking already depends on, so there is exactly one place in the
- * daemon that decides "how idle is this process", not two that could
- * silently disagree.
+ * Selection calls select_cold_victims() fresh every cycle -- no shared
+ * table, no background thread maintaining one. This is the same
+ * function the reactive path calls at the moment PSI fires, so there
+ * is exactly one place in the daemon that decides "how cold is this
+ * process", not two that could silently disagree.
  */
-#define TRICKLE_INTERVAL_MS   400
-#define TRICKLE_CHUNK_BYTES   (2 * 1024 * 1024)
-#define TRICKLE_IDLE_FLOOR    30
+#define TRICKLE_INTERVAL_MS      400
+#define TRICKLE_CHUNK_BYTES      (2 * 1024 * 1024)
+#define TRICKLE_COLDNESS_FLOOR   70
 
 /* Adaptive chunk sizing: scale linearly with how fast MemAvailable is
  * actually falling, measured on this thread's own 400ms cadence -- not
@@ -1352,18 +1171,25 @@ static void *idle_trickle_thread(void *arg)
 
         size_t chunk_ceiling = adaptive_chunk_bytes(fill_rate_kb_per_sec);
 
+        candidate_t candidates[MAX_CANDIDATES];
+        int n_candidates = select_cold_victims(candidates, MAX_CANDIDATES);
+
+        /* Publish status here -- this is the only continuously-running
+         * loop left in the daemon, and it already has a fresh
+         * candidate snapshot every cycle. Replaces the old scanner
+         * thread's publish site. */
+        write_status_file(candidates, n_candidates);
+
         pid_t target_pid = -1;
         char  target_name[64] = {0};
 
-        pthread_mutex_lock(&g_cand_lock);
-        if (g_n_candidates > 0 &&
-            g_candidates[0].idle_streak >= TRICKLE_IDLE_FLOOR) {
-            target_pid = g_candidates[0].pid;
-            memcpy(target_name, g_candidates[0].name, sizeof(target_name) - 1);
+        if (n_candidates > 0 &&
+            candidates[0].coldness_pct >= TRICKLE_COLDNESS_FLOOR) {
+            target_pid = candidates[0].pid;
+            memcpy(target_name, candidates[0].name, sizeof(target_name) - 1);
         }
-        pthread_mutex_unlock(&g_cand_lock);
 
-        if (target_pid <= 0) continue;  /* nothing idle enough right now */
+        if (target_pid <= 0) continue;  /* nothing cold enough right now */
 
         if (target_pid != last_pid) {
             /* Victim changed since last cycle -- re-collect VMAs and
@@ -1501,26 +1327,32 @@ static void handle_pressure(void)
                mem_avail_kb / 1024);
     }
 
-    /* Grab best pre-computed victim instantly -- no scanning here */
-    pthread_mutex_lock(&g_cand_lock);
+    /* On-demand selection: PSI just fired, which is the one real event
+     * that justifies the cost of a /proc walk. No background thread
+     * maintains a candidate list anymore -- see select_cold_victims()
+     * for why: idle-time and coldness aren't push-notified by the
+     * kernel, so the only way to avoid polling for them continuously
+     * is to only ever ask at the moment they're actually needed. */
+    candidate_t candidates[MAX_CANDIDATES];
+    int n_candidates = select_cold_victims(candidates, MAX_CANDIDATES);
+
     pid_t vpid = -1;
     char  vname[64] = {0};
-    if (g_n_candidates > 0) {
-        vpid = g_candidates[0].pid;
-        memcpy(vname, g_candidates[0].name, 63); vname[63]=0;
+    if (n_candidates > 0) {
+        vpid = candidates[0].pid;
+        memcpy(vname, candidates[0].name, 63); vname[63]=0;
     }
-    pthread_mutex_unlock(&g_cand_lock);
 
     if (vpid < 0) {
         /*
-         * No pre-computed candidate. This is not a "nothing to do" state --
+         * No candidate found. This is not a "nothing to do" state --
          * PSI fired and MemAvailable is below floor, which is a claim that
-         * relief is needed. The scanner's candidate list can legitimately
+         * relief is needed. select_cold_victims()'s result can legitimately
          * be empty (every process under MIN_VICTIM_RSS_KB, or the pressure
-         * source already exited between scan and trigger), but the system
-         * is still under real pressure and something downstream -- the next
-         * allocation, the next page fault -- assumes that pressure gets
-         * relieved. Silently returning here is exactly Chapter 12's
+         * source already exited between the scan and this check), but the
+         * system is still under real pressure and something downstream --
+         * the next allocation, the next page fault -- assumes that pressure
+         * gets relieved. Silently returning here is exactly Chapter 12's
          * "missing precondition" pattern: it looks non-fatal in isolation,
          * but the invariant PSI exists to protect (bounded stall) is left
          * violated with no visible signal beyond a log line.
@@ -1537,7 +1369,7 @@ static void handle_pressure(void)
          *      instead of swallowing it.
          */
         rp_log(LOG_WARNING,
-               "no pre-computed victim -- relaxed rescan (floor %ld->%ld KB)",
+               "no victim found -- relaxed rescan (floor %ld->%ld KB)",
                (long)MIN_VICTIM_RSS_KB, (long)(MIN_VICTIM_RSS_KB / 4));
 
         pid_t epid = -1;
@@ -1742,23 +1574,11 @@ int main(int argc, char *argv[])
         rp_log(LOG_INFO, "OOM immunity set for critical desktop processes");
     }
 
-    /* Phase 2: start background scanner thread */
-    pthread_t scanner_tid;
-    if (pthread_create(&scanner_tid, NULL, scanner_thread, NULL) != 0) {
-        rp_log(LOG_ERR,"pthread_create: %s",strerror(errno)); return 1;
-    }
-    pthread_detach(scanner_tid);
-    rp_log(LOG_INFO,"scanner thread started (interval=%dms)",SCAN_INTERVAL_MS);
-
-    /* Give scanner one pass before arming PSI */
-    struct timespec warmup = { .tv_sec=0, .tv_nsec=(long)(SCAN_INTERVAL_MS+200)*1000000L };
-    nanosleep(&warmup, NULL);
-
-    /* Phase 2b: start proactive idle-trickle thread -- independent of
+    /* Phase 2: start proactive idle-trickle thread -- independent of
      * PSI, runs continuously at TRICKLE_INTERVAL_MS regardless of
-     * pressure. Started after the scanner warmup above so its first
-     * cycle already has real candidate data to select from rather than
-     * racing an empty g_candidates on startup. */
+     * pressure. Each cycle calls select_cold_victims() fresh -- no
+     * warmup needed, since there is no background table to prime;
+     * on-demand selection has nothing to race on startup. */
     pthread_t trickle_tid;
     if (pthread_create(&trickle_tid, NULL, idle_trickle_thread, NULL) != 0) {
         rp_log(LOG_WARNING, "idle-trickle pthread_create failed: %s -- "

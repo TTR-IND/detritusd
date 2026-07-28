@@ -31,9 +31,7 @@ choice.
 desktop, on real hardware.** It should work on any Devuan-based or
 similar OpenRC-based Linux system with a reasonably recent kernel
 (5.10+ for `process_madvise`; PSI support compiled in, which is
-standard on most modern kernels). Testing on a 16 year old Intel Atom
-laptopyelided impressive results with Chrome staying completely stable
-and very responsive during heavy video playback and benchmark tests.
+standard on most modern kernels).
 
 It has **not** been tested on other distributions or init systems
 (systemd, runit, s6, etc.). The core daemon (`detritus.c`) has no
@@ -44,6 +42,14 @@ contributions documenting or automating that are welcome.
 
 ## How it works, briefly
 
+- On startup, provisions its own ZRAM device (sized relative to total
+  RAM and adjusted for storage speed) and disables `zswap` if it was
+  enabled, so ZRAM is the sole in-memory compression layer rather than
+  one that `zswap` would otherwise intercept most traffic ahead of.
+  Existing partition swap is disabled the same way once ZRAM is
+  active — detritusd takes over the compression/swap layer outright
+  rather than sharing it with whatever the distro configured by
+  default.
 - Reads `/proc/pressure/memory` via `epoll`, armed with a PSI trigger
   tuned to catch real stalls early without firing on routine I/O.
 - A background scanner ranks candidate processes by RSS and idle time
@@ -59,10 +65,15 @@ contributions documenting or automating that are welcome.
   once `MemAvailable` recovers or PSI drops back below threshold.
 - Publishes live status (`/run/detritus/status.json`) for anything
   that wants to display it — see
-  [Gonzo System Monitor](https://github.com/TTR-IND/gonzo-system-monitor)
+  [Gonzo System Monitor](https://github.com/YOUR_GITHUB/gonzo-system-monitor)
   for a GUI that consumes this.
 
 ## Requirements
+
+**Note:** detritusd disables `zswap` on startup (if present) and takes
+over partition swap and ZRAM configuration. If you've deliberately
+tuned `zswap` yourself, or rely on existing partition swap, read
+[How it works](#how-it-works-briefly) above before installing.
 
 - Linux kernel 5.10 or newer (for `process_madvise`)
 - `/proc/pressure/memory` present (PSI enabled in the kernel config —
