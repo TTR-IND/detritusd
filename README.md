@@ -1,26 +1,35 @@
 # detritusd
 
-A PSI-driven memory pressure daemon for Linux, inspired by the design
-goals of Apple's Jetsam: keep applications responsive under heavy
-multitasking, and prevent processes from freezing under memory
-pressure, without a fixed threshold that "suddenly" kicks in.
+A small helper daemon for the memory management Linux already has.
 
-detritusd does two independent things:
+The kernel already does the real work: `kswapd` and the page LRU
+continuously reclaim cold memory in the background, and PSI (Pressure
+Stall Information) already tells userspace exactly when a process is
+genuinely stalled waiting on memory, not just "using a lot of it."
+detritusd doesn't duplicate any of that. It adds two small, narrow
+things the kernel has no policy for on its own:
 
-1. **Proactive idle trickle.** A continuous, low-priority background
-   thread marks memory from genuinely idle processes as reclaimable
-   (`MADV_COLD`), at a gentle cadence that scales up smoothly with how
-   fast memory is actually being consumed. `MADV_COLD` is a hint the
-   kernel schedules on its own terms rather than a forced reclaim.
+1. **A gentle nudge toward the coldest memory before things get bad.**
+   The kernel's own page-table accounting (`Referenced` vs. `Rss` in
+   `/proc/pid/smaps_rollup`) already knows which process's memory
+   hasn't been touched in a while. detritusd reads that signal
+   on-demand and marks a small chunk of it `MADV_COLD` — a hint the
+   kernel schedules on its own terms, not a forced reclaim — at a
+   gentle, ongoing cadence that scales up smoothly with how fast
+   memory is actually being consumed.
 
-2. **Reactive last-resort relief.** If the kernel's own [PSI (Pressure
-   Stall Information)](https://docs.kernel.org/accounting/psi.html)
-   signal crosses a real stall threshold — meaning a process is
-   *actually* waiting on memory, not just "memory usage is high" —
-   detritusd freezes (`SIGSTOP`) the least-recently-useful large
-   process and trickles its memory into ZRAM, then resumes it the
-   moment pressure clears. This is the emergency fallback, not the
-   normal mode of operation.
+2. **A last-resort freeze, only when PSI says a real stall is
+   happening.** If `/proc/pressure/memory` crosses a real stall
+   threshold, detritusd freezes (`SIGSTOP`) the coldest large process
+   it can find at that moment and pages its memory into ZRAM, then
+   resumes it once pressure clears. This is the emergency fallback,
+   triggered by the kernel's own signal, not a fixed threshold guessed
+   in userspace.
+
+Inspired by the outcome Apple's Jetsam aims for on macOS/iOS — keep
+things responsive under heavy multitasking rather than stalling —
+built entirely on primitives Linux already ships, not a from-scratch
+reimplementation of memory management.
 
 See the comments in `detritus.c` for the reasoning behind each design
 choice.
@@ -32,6 +41,10 @@ desktop, on real hardware.** It should work on any Devuan-based or
 similar OpenRC-based Linux system with a reasonably recent kernel
 (5.10+ for `process_madvise`; PSI support compiled in, which is
 standard on most modern kernels).
+
+Testing on a 16 year old Intel Atom
+laptop yelided impressive results with Chrome staying completely stable
+and very responsive during heavy video playback and benchmark tests.
 
 It has **not** been tested on other distributions or init systems
 (systemd, runit, s6, etc.). The core daemon (`detritus.c`) has no
@@ -51,18 +64,23 @@ contributions documenting or automating that are welcome.
   rather than sharing it with whatever the distro configured by
   default.
 - Reads `/proc/pressure/memory` via `epoll`, armed with a PSI trigger
-  tuned to catch real stalls early without firing on routine I/O.
-- A background scanner ranks candidate processes by RSS and idle time
-  (consecutive scan cycles with zero scheduler activity), so the
-  daemon always knows, in advance, what it would act on if it needed
-  to — no scanning-under-pressure delay.
-- The idle-trickle thread reads the same ranked list and proactively
-  marks small chunks of the most-idle candidate's memory `MADV_COLD`,
-  scaling the chunk size with how fast `MemAvailable` is actually
-  falling.
-- On a real PSI trigger, the top candidate is frozen and its memory is
-  paged into ZRAM via `process_madvise(MADV_PAGEOUT)`, then resumed
-  once `MemAvailable` recovers or PSI drops back below threshold.
+  tuned to catch real stalls early without firing on routine I/O. This
+  is the only genuinely event-driven signal in the system; everything
+  else below is read on-demand, never on a background timer.
+- There is no continuously-running scanner. Candidate selection
+  (`select_cold_victims()`) walks `/proc` once, only at the moment
+  it's actually needed, and ranks processes by how cold their memory
+  is per the kernel's own `Referenced`/`Rss` accounting — not a
+  userspace-derived guess accumulated over time.
+- A low-priority background thread runs on a fixed, gentle cadence
+  (well under the point where any polling would be noticeable) and,
+  each cycle, asks for the single coldest eligible process and marks a
+  small chunk of its memory `MADV_COLD`, scaling the chunk size with
+  how fast `MemAvailable` is actually falling.
+- On a real PSI trigger, the coldest large process at that exact
+  moment is frozen and its memory is paged into ZRAM via
+  `process_madvise(MADV_PAGEOUT)`, then resumed once `MemAvailable`
+  recovers or PSI drops back below threshold.
 - Publishes live status (`/run/detritus/status.json`) for anything
   that wants to display it — see
   [Gonzo System Monitor](https://github.com/TTR-IND/gonzo-system-monitor)
@@ -102,9 +120,9 @@ Before starting the service (the installer will remind you), edit
 DETRITUS_NOTIFY_USER="yourusername"
 ```
 
-Without this, detritus still runs and manages memory pressure, but:
+Without this, detritusd still runs its normal cycle, but:
 - Desktop notifications on freeze events won't fire.
-- Victim scanning won't be scoped to a single user's processes (it
+- Candidate selection won't be scoped to a single user's processes (it
   will consider processes belonging to any user on the system).
 
 ### Manual build (no service integration)
@@ -127,17 +145,28 @@ sudo ./install.sh --uninstall
 
 ```bash
 cat /var/log/detritusd.log
-sudo rc-service detritus status
+sudo rc-service detritusd status
 ```
 
 ## Status file (for integrations)
 
-detritus publishes a live JSON snapshot at `/run/detritus/status.json`
+detritusd publishes a live JSON snapshot at `/run/detritus/status.json`
 every ~2 seconds, world-readable, atomically written. Fields include
 PSI pressure, memory-change rate, ZRAM usage, trickle activity, and
 frozen-process state. See the `write_status_file()` function in
 `detritus.c` for the exact schema — it's small and stable
 (`schema_version` is bumped on any breaking change).
+
+## Related projects
+
+- [Gonzo System Monitor](https://github.com/TTR-IND/gonzo-system-monitor)
+  — a fork of MATE System Monitor with a UI built to display this
+  daemon's live status.
+- [gonzocache](https://github.com/TTR-IND/gonzocache) — a separate
+  companion daemon that preloads your most-used apps into page cache
+  at login. Independent of detritusd (neither requires the other to
+  be installed), but detritusd will report gonzocache's real page-cache
+  residency in its own status file if both are present.
 
 ## License
 

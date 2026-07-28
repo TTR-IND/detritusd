@@ -1,5 +1,5 @@
 /*
- * detritus.c -- Event-Driven Memory Manager for Linux -- Torfaen Technology Research
+ * detritus.c -- Event-Driven Memory Manager for Linux
  *
  * Runs as root. Monitors Linux PSI via epoll on /proc/pressure/memory.
  *
