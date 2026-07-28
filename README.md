@@ -85,7 +85,7 @@ tuned `zswap` yourself, or rely on existing partition swap, read
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_GITHUB/detritus.git
+git clone https://github.com/TTR-IND/detritus.git
 cd detritus
 sudo ./install.sh
 ```
