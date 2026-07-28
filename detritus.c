@@ -1,5 +1,5 @@
 /*
- * detritus.c -- Event-Driven Memory Manager for Linux -- Torfaen Technology Research
+ * detritus.c -- Event-Driven Memory Manager for Linux
  *
  * Runs as root. Monitors Linux PSI via epoll on /proc/pressure/memory.
  *
@@ -1149,6 +1149,27 @@ static void *idle_trickle_thread(void *arg)
     long   prev_avail_kb = -1;
     struct timespec prev_sample_ts = {0, 0};
 
+    /* Candidate re-scan cadence, decoupled from the 400ms action
+     * cadence above. select_cold_victims() and write_status_file()
+     * are genuinely expensive relative to a 400ms budget -- a full
+     * /proc walk with a fopen/fgets/fclose pair per eligible process,
+     * plus a mkstemp+write+fsync+rename for the status file -- and
+     * running both on every single trickle tick was a real regression
+     * found by a user report of long silent gaps followed by larger
+     * chunks than expected: the scan/write cost was very likely
+     * stalling the thread's own nanosleep cycle, so the "fill rate"
+     * calculation was measuring an artificially widened gap between
+     * delayed cycles, not a genuinely fast fill. Candidates are
+     * re-scanned every SCAN_REFRESH_CYCLES ticks (5 * 400ms = 2s,
+     * matching the old scanner thread's actual cadence and the GUI's
+     * own poll rate) and reused on the cycles in between; the
+     * MADV_COLD action itself still runs every 400ms tick against
+     * whichever scan is currently cached. */
+#define SCAN_REFRESH_CYCLES 5
+    candidate_t cached_candidates[MAX_CANDIDATES];
+    int cached_n_candidates = 0;
+    int cycles_since_scan = SCAN_REFRESH_CYCLES;  /* force a scan on the first tick */
+
     for (;;) {
         nanosleep(&cycle, NULL);
 
@@ -1185,19 +1206,26 @@ static void *idle_trickle_thread(void *arg)
 
         size_t chunk_ceiling = adaptive_chunk_bytes(fill_rate_kb_per_sec);
 
-        candidate_t candidates[MAX_CANDIDATES];
-        int n_candidates = select_cold_victims(candidates, MAX_CANDIDATES);
+        cycles_since_scan++;
+        if (cycles_since_scan >= SCAN_REFRESH_CYCLES) {
+            cached_n_candidates = select_cold_victims(cached_candidates, MAX_CANDIDATES);
+            /* Publish status here -- this is the only continuously-running
+             * loop left in the daemon, and it has a fresh candidate
+             * snapshot exactly when this branch runs. Replaces the old
+             * scanner thread's publish site, at roughly the same
+             * cadence it used to run at. */
+            write_status_file(cached_candidates, cached_n_candidates);
+            cycles_since_scan = 0;
+        }
 
-        /* Publish status here -- this is the only continuously-running
-         * loop left in the daemon, and it already has a fresh
-         * candidate snapshot every cycle. Replaces the old scanner
-         * thread's publish site. */
-        write_status_file(candidates, n_candidates);
+        candidate_t *candidates = cached_candidates;
+        int n_candidates = cached_n_candidates;
 
         pid_t target_pid = -1;
         char  target_name[64] = {0};
 
         if (n_candidates > 0 &&
+
             candidates[0].coldness_pct >= TRICKLE_COLDNESS_FLOOR) {
             target_pid = candidates[0].pid;
             memcpy(target_name, candidates[0].name, sizeof(target_name) - 1);
