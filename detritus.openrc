@@ -11,18 +11,17 @@
 # expecting the binary to do it itself.
 
 name="detritusd"
-description="Memory pressure manager (Jetsam-style freeze+compress for Linux)"
+description="Memory pressure manager (freeze, compress, discard)"
 command="/usr/local/sbin/detritusd"
 command_background="yes"
 pidfile="/run/${RC_SVCNAME}.pid"
 
 # DETRITUS_NOTIFY_USER is read by detritus.c in two places: notify_user()
 # (who gets the desktop notification when a process is frozen) and
-# scanner_thread() (restricts victim scanning to one user's processes if
-# set). Without this set, both behaviors silently never activate -- not
-# a crash, just quietly absent functionality. Set it in
-# /etc/conf.d/detritus, which OpenRC sources automatically before
-# start() runs (standard OpenRC convention, not detritusd-specific).
+# lookup_notify_uid() (restricts victim scanning to one user's processes
+# if set). Without this set, notifications do not fire and scanning is
+# not scoped to a single user. Set it in /etc/conf.d/detritus, which
+# OpenRC sources automatically before start() runs.
 export DETRITUS_NOTIFY_USER
 
 output_log="/var/log/detritusd.log"

@@ -1,0 +1,3 @@
+detritus.conf.d etc/conf.d/detritus
+debian/detritusd.run etc/sv/detritusd/run
+runit/log/run etc/sv/detritusd/log/run

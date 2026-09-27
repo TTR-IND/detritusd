@@ -1,0 +1,5 @@
+#!/bin/sh
+exec 2>&1
+[ -r /etc/conf.d/detritus ] && . /etc/conf.d/detritus
+export DETRITUS_NOTIFY_USER
+exec /usr/sbin/detritusd

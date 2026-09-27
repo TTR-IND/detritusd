@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        if [ -d /etc/service ]; then
+            if [ -e /etc/service/detritusd ] || [ -L /etc/service/detritusd ]; then
+                if [ "$(readlink /etc/service/detritusd 2>/dev/null || true)" != /etc/sv/detritusd ]; then
+                    echo "refusing to replace existing /etc/service/detritusd" >&2
+                    exit 1
+                fi
+            else
+                ln -s /etc/sv/detritusd /etc/service/detritusd
+            fi
+            sv up detritusd >/dev/null 2>&1 || true
+        fi
+        ;;
+esac

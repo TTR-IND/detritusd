@@ -1,4 +1,5 @@
-# /etc/conf.d/detritus -- configuration for the detritus OpenRC service
+# /etc/conf.d/detritus -- configuration for detritusd
+# Sourced by both the OpenRC service and the runit run script.
 #
 # DETRITUS_NOTIFY_USER: the local username whose desktop session should
 # receive freeze notifications (via notify-send) and whose processes

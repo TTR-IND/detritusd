@@ -1,0 +1,3 @@
+#!/bin/sh
+mkdir -p /var/log/detritusd
+exec svlogd -tt /var/log/detritusd

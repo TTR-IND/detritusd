@@ -1,0 +1,14 @@
+Source: detritusd
+Section: admin
+Priority: optional
+Maintainer: GonzOS Packaging <packages@gonzos.invalid>
+Build-Depends: debhelper-compat (= 13), gcc, make
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+
+Package: detritusd
+Architecture: any
+Depends: ${misc:Depends}, runit
+Description: PSI-driven ZRAM and memory-pressure policy daemon
+ detritusd manages ZRAM pressure using Linux PSI and process-madvise.
+ It ships and enables a runit service for Devuan Excalibur.
