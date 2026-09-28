@@ -1,0 +1,3 @@
+./detritus.conf.d
+./debian/detritusd.run
+./runit/log/run

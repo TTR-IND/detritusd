@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+
+if [ "$(readlink /etc/service/detritusd 2>/dev/null || true)" = /etc/sv/detritusd ]; then
+    rm -f /etc/service/detritusd
+fi

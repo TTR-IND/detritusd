@@ -1,0 +1,9 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: detritusd
+Source: https://github.com/TTR-IND/detritusd
+
+Files: *
+Copyright: 2026 Josh A. Wheatstone, Torfaen Technology Research IND
+License: AGPL-3+
+ This package is distributed under the GNU Affero General Public License,
+ version 3 or later.  The full text is in /usr/share/common-licenses/AGPL-3.
